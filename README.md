@@ -48,13 +48,18 @@ Then start the loop inside pi:
 | `init_experiment` | One-time session config — name, metric, unit, direction |
 | `run_experiment` | Runs any command, times wall-clock duration, captures output |
 | `log_experiment` | Records result, auto-commits, updates widget and dashboard |
+| `ask_experiment_question` | *(setup only)* Asks one focused question with clickable options and a recommended answer |
+| `propose_experiment_plan` | *(setup only)* Shows the full plan and asks confirm / keep refining / cancel |
+
+The two setup tools exist only while a new session is being planned. The loop tools stay unavailable until you confirm a plan, so a half-specified idea can never start burning iterations.
 
 ### `/autoresearch` command
 
 | Subcommand | Description |
 |------------|-------------|
 | `/autoresearch` or `/autoresearch help` | Show help without activating autoresearch mode. `--help` and `-h` work too. |
-| `/autoresearch <text>` | Enter autoresearch mode. If `.auto/prompt.md` exists, resumes the loop with `<text>` as context. Otherwise, sets up a new session. |
+| `/autoresearch <text>` | Enter autoresearch mode. If `.auto/prompt.md` exists, resumes the loop with `<text>` as context. Otherwise, starts guided setup: the agent asks a few questions, shows a plan and waits for your confirmation. |
+| `/autoresearch --no-interview <text>` | Same, but skips guided setup and goes straight to writing `.auto/` files (for when you already know the goal). |
 | `/autoresearch off` | Leave autoresearch mode. Stops auto-resume and clears runtime state but keeps `.auto/log.jsonl` intact. |
 | `/autoresearch finalize` | Stop the loop like `off` (aborting a run in progress), then load the `autoresearch-finalize` skill to turn kept experiments into reviewable branches. |
 | `/autoresearch clear` | Delete `.auto/log.jsonl`, reset all state, and turn autoresearch mode off. Use this for a clean start. |
@@ -133,7 +138,7 @@ extension binds nothing by default.
 
 ### Skills
 
-**`autoresearch-create`** asks a few questions (or infers from context) about your goal, command, metric, and files in scope — then writes two files and starts the loop immediately:
+**`autoresearch-create`** runs guided setup: a short back-and-forth that pins down the goal, the command, the metric (with unit and direction), files in scope and constraints — then presents the whole plan for confirmation before anything runs:
 
 **`autoresearch-finalize`** turns a noisy autoresearch branch into clean, independent branches — one per logical change, each starting from the merge-base. Groups must not share files, so each branch can be reviewed and merged independently.
 

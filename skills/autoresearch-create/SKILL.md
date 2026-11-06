@@ -31,11 +31,18 @@ All session files live in a single `.auto/` subfolder at the working directory r
 
 ## Setup
 
-1. Ask (or infer): **Goal**, **Command**, **Metric** (+ direction), **Files in scope**, **Constraints**.
-2. `git checkout -b autoresearch/<goal>-<date>`
+A fresh session starts in the **interview phase**: no plan is confirmed yet, so the loop tools are unavailable and only the two setup tools are active.
+
+1. Read the source first, then ask focused questions with **`ask_experiment_question`** — one per call, 2–5 concrete options, `recommended` set to the option you would pick, `allow_custom` left on. Ask only what you cannot infer from the repo. Batchable uncertainty belongs in one question, not five.
+2. When the **Goal**, **Command**, **Metric** (+ unit, direction), **Files in scope**, **Off limits**, **Constraints** and optional **Checks** are settled, call **`propose_experiment_plan`**. It renders the full plan and asks the user to *Confirm / Keep refining / Cancel*.
+   - `keep refining` comes back with what they want changed — fix the root cause, then propose again. Do not reword the same plan.
+   - On confirmation you receive the plan back verbatim; build the session from it.
+3. `git checkout -b autoresearch/<goal>-<date>`
 3. Read the source files. Understand the workload deeply before writing anything.
-4. `mkdir -p .auto`, then write `.auto/prompt.md` and `.auto/measure.sh` (see below). Commit both.
+4. `mkdir -p .auto`, then write `.auto/prompt.md` and `.auto/measure.sh` (see below) exactly as the confirmed plan says. Commit both.
 5. `init_experiment` → run baseline → `log_experiment` → start looping immediately.
+
+Never skip the confirmation on your own initiative. If the user asks to, they can restart with `/autoresearch --no-interview <goal>`; headless sessions (no UI) skip the interview automatically.
 
 ### `.auto/prompt.md`
 
