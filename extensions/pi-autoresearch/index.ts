@@ -54,6 +54,28 @@ import {
 } from "./compaction.ts";
 import { resolveAutoresearchShortcuts, SHORTCUT_ACTIONS } from "./shortcuts.ts";
 import { getAutoresearchArgumentCompletions, isHelpRequest, renderAutoresearchHelp } from "./commands.ts";
+import {
+  ASK_QUESTION_TOOL_NAME,
+  DIALOG_UNAVAILABLE_HINT,
+  INTERVIEW_ENTRY,
+  INTERVIEW_ENTRY_VERSION,
+  PLAN_CANCEL,
+  PLAN_CONFIRM,
+  PROPOSE_PLAN_TOOL_NAME,
+  confirmedPlanSteer,
+  formatInterviewAnswers,
+  interviewSystemPromptSection,
+  isInterviewLive,
+  readInterviewEntry,
+  renderPlan,
+  renderPlanSummary,
+  reviewPlan,
+  runQuestionnaire,
+  validatePlan,
+  type ExperimentPlan,
+  type InterviewEntry,
+  type InterviewQuestion,
+} from "./interview.ts";
 import { sessionFilePath, sessionFileCandidates, ensureParentDir, AUTO_DIR } from "./paths.ts";
 
 // ---------------------------------------------------------------------------
@@ -179,6 +201,10 @@ interface LogDetails {
 
 interface AutoresearchRuntime {
   autoresearchMode: boolean;
+  /** Setup interview is running: loop tools are off until the plan is confirmed. */
+  interviewMode: boolean;
+  /** Topic the user typed on /autoresearch, echoed into the interview goals. */
+  interviewTopic: string;
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
@@ -728,6 +754,8 @@ function createExperimentState(): ExperimentState {
 function createSessionRuntime(): AutoresearchRuntime {
   return {
     autoresearchMode: false,
+    interviewMode: false,
+    interviewTopic: "",
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
@@ -1088,21 +1116,61 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const getRuntime = (ctx: ExtensionContext): AutoresearchRuntime =>
     runtimeStore.ensure(getSessionKey(ctx));
 
-  // Registering through this gates the tool, so a new one can't slip in ungated.
-  const gatedToolNames = new Set<string>();
-  const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
-    gatedToolNames.add(tool.name);
+  // Registering through these gates the tool, so a new one can't slip in ungated.
+  // A session has two phases: `interview` (setup questions — no experiments may
+  // run yet) and `loop` (the experiment loop). Every tool belongs to one phase.
+  type ToolPhase = "loop" | "interview";
+  const phaseToolNames: Record<ToolPhase, Set<string>> = { loop: new Set(), interview: new Set() };
+  const registerPhaseTool = (phase: ToolPhase, tool: Parameters<typeof pi.registerTool>[0]): void => {
+    phaseToolNames[phase].add(tool.name);
     pi.registerTool(tool);
+  };
+  const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
+    registerPhaseTool("loop", tool);
+  };
+  const registerInterviewTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
+    registerPhaseTool("interview", tool);
+  };
+
+  // The one place the tool surface is derived: mode + phase pick the set, so the
+  // active tools can never drift from the runtime flags.
+  const syncToolSurface = (ctx: ExtensionContext): void => {
+    const runtime = getRuntime(ctx);
+    const interviewing = runtime.autoresearchMode && runtime.interviewMode;
+    const activeTools = new Set(pi.getActiveTools()); // setActiveTools replaces the whole set
+    for (const tool of phaseToolNames.loop) {
+      runtime.autoresearchMode && !interviewing ? activeTools.add(tool) : activeTools.delete(tool);
+    }
+    for (const tool of phaseToolNames.interview) {
+      interviewing ? activeTools.add(tool) : activeTools.delete(tool);
+    }
+    pi.setActiveTools([...activeTools]);
   };
 
   // The one place mode flips: gated tools follow the flag, never drifting from it.
   const setAutoresearchMode = (ctx: ExtensionContext, enabled: boolean): void => {
-    getRuntime(ctx).autoresearchMode = enabled;
-    const activeTools = new Set(pi.getActiveTools()); // setActiveTools replaces the whole set
-    for (const tool of gatedToolNames) {
-      enabled ? activeTools.add(tool) : activeTools.delete(tool);
+    const runtime = getRuntime(ctx);
+    runtime.autoresearchMode = enabled;
+    if (!enabled) runtime.interviewMode = false;
+    syncToolSurface(ctx);
+  };
+
+  // Entering/leaving the setup interview swaps the tool surface in one step.
+  const setInterviewMode = (ctx: ExtensionContext, enabled: boolean, topic?: string): void => {
+    const runtime = getRuntime(ctx);
+    runtime.interviewMode = enabled;
+    if (topic !== undefined) runtime.interviewTopic = topic;
+    syncToolSurface(ctx);
+  };
+
+  // Durable interview state: compaction and tree navigation must not lose the
+  // fact that no plan has been confirmed yet.
+  const writeInterviewEntry = (ctx: ExtensionContext, entry: InterviewEntry): void => {
+    try {
+      pi.appendEntry(INTERVIEW_ENTRY, entry);
+    } catch {
+      // Session entries are best-effort; the in-memory runtime still enforces phase.
     }
-    pi.setActiveTools([...activeTools]);
   };
 
   const recordAutoresearchActivation = (workDir: string, active: boolean): void => {
@@ -1384,6 +1452,24 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       ),
     );
 
+    // Restore an unconfirmed setup interview from the durable entry: compaction
+    // and tree switches must never drop the user back into the loop unconfirmed.
+    let interview: InterviewEntry | null = null;
+    try {
+      interview = readInterviewEntry(ctx.sessionManager.getBranch());
+    } catch {
+      interview = null;
+    }
+    if (isInterviewLive(interview)) {
+      runtime.interviewMode = true;
+      runtime.interviewTopic = interview!.topic;
+      setAutoresearchMode(ctx, true);
+    } else {
+      runtime.interviewMode = false;
+      runtime.interviewTopic = "";
+      syncToolSurface(ctx);
+    }
+
     updateWidget(ctx);
   };
 
@@ -1533,6 +1619,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       `\n${BENCHMARK_GUARDRAIL}` +
       "\nIf the user sends a follow-on message while an experiment is running, finish the current run_experiment + log_experiment cycle first, then address their message in the next iteration.";
 
+    // Interview phase: no plan is confirmed yet, so the protocol replaces the
+    // "just start looping" instructions until propose_experiment_plan succeeds.
+    if (runtime.interviewMode) extra += interviewSystemPromptSection();
+
     if (hasChecks) {
       extra +=
         "\n\n## Backpressure Checks (ACTIVE)" +
@@ -1550,6 +1640,280 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     return {
       systemPrompt: event.systemPrompt + extra,
     };
+  });
+
+  // -----------------------------------------------------------------------
+  // Interview tools — guided setup before the loop may start
+  // -----------------------------------------------------------------------
+
+  registerInterviewTool({
+    name: ASK_QUESTION_TOOL_NAME,
+    label: "Ask Experiment Question",
+    description:
+      "Ask the user one focused setup question (with concrete options and a recommended answer) during the autoresearch interview, and return their answer. Only available before a plan is confirmed.",
+    promptSnippet: "Ask one setup question with options during the autoresearch interview.",
+    promptGuidelines: [
+      "Use ask_experiment_question only while planning a new session, before propose_experiment_plan.",
+      "Ask one question per call. Offer 2-5 concrete, mutually exclusive options and set `recommended` to the one you would pick.",
+      "Read the repository first: ask only what you cannot infer from the code.",
+    ],
+    parameters: Type.Object({
+      question: Type.String({ description: "The question to ask the user." }),
+      context: Type.Optional(
+        Type.String({ description: "Short context shown under the question, e.g. what you inferred from the repo." }),
+      ),
+      options: Type.Optional(
+        Type.Array(Type.String(), {
+          description: "2–5 concrete answer options. Omit entirely to ask a free-text question.",
+        }),
+      ),
+      recommended: Type.Optional(
+        Type.Integer({ minimum: 0, description: "Zero-based index of the option you recommend." }),
+      ),
+      allow_custom: Type.Optional(
+        Type.Boolean({ description: "Offer a write-your-own answer alongside the options. Default: true." }),
+      ),
+    }),
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      if (!getRuntime(ctx).interviewMode) {
+        return {
+          content: [{
+            type: "text",
+            text: "No setup interview is active — the plan is already confirmed (or no session is being set up). Ask in chat instead.",
+          }],
+          details: {},
+        };
+      }
+
+      const question: InterviewQuestion = {
+        id: "question",
+        question: params.question,
+        context: params.context,
+        options: params.options ?? [],
+        recommended: params.recommended,
+        allowCustom: params.allow_custom,
+      };
+
+      const result = await runQuestionnaire(ctx, [question]);
+      if (result.unavailable) {
+        return { content: [{ type: "text", text: DIALOG_UNAVAILABLE_HINT }], details: {} };
+      }
+      if (result.cancelled) {
+        return {
+          content: [{
+            type: "text",
+            text: "The user dismissed the question without answering. Continue the conversation in chat; the interview is still active.",
+          }],
+          details: {},
+        };
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `${formatInterviewAnswers(result)}\n\nAsk the next question, or call ${PROPOSE_PLAN_TOOL_NAME} once the objective, workload, command, metric, scope and constraints are settled.`,
+        }],
+        details: { answers: result.answers },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ask_experiment_question ")) + theme.fg("accent", args.question ?? ""),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? theme.fg("muted", t.text) : "", 0, 0);
+    },
+  });
+
+  const PlanParams = Type.Object({
+    objective: Type.String({
+      description: "One sentence: what is being optimized, on which workload. Becomes the objective in .auto/prompt.md.",
+    }),
+    workload: Type.String({
+      description: "What each iteration actually measures (benchmark, test suite, script, dataset).",
+    }),
+    command: Type.String({
+      description: 'Command the loop runs every iteration. Usually "./.auto/measure.sh".',
+    }),
+    metric_name: Type.String({
+      description:
+        'Primary metric name as a single token with no whitespace — measure.sh emits METRIC name=value (e.g. "total_us", "val_bpb").',
+    }),
+    metric_unit: Type.Optional(
+      Type.String({ description: 'Unit for the primary metric: "µs", "ms", "s", "kb", "mb", or "" for unitless.' }),
+    ),
+    direction: Type.String({
+      description: 'Whether "lower" or "higher" is better for the primary metric.',
+    }),
+    secondary_metrics: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "Independent tradeoff monitors logged alongside the primary metric.",
+      }),
+    ),
+    files_in_scope: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "Every file the loop may modify, each with a brief note on what it does.",
+      }),
+    ),
+    off_limits: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "What must not be touched: other packages, generated code, public API, the benchmark itself.",
+      }),
+    ),
+    constraints: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "Hard rules: tests must pass, no new dependencies, no benchmark edits, time or memory budgets.",
+      }),
+    ),
+    checks: Type.Optional(
+      Type.Array(Type.String(), {
+        description: "Hard correctness gates to encode in .auto/checks.sh. Omit when no correctness validation is wanted.",
+      }),
+    ),
+    max_iterations: Type.Optional(
+      Type.Union([Type.Integer({ minimum: 1 }), Type.Null()], {
+        description: "Optional iteration cap written to .auto/config.json. Omit or null for unbounded.",
+      }),
+    ),
+  });
+
+  registerInterviewTool({
+    name: PROPOSE_PLAN_TOOL_NAME,
+    label: "Propose Experiment Plan",
+    description:
+      "Present the complete experiment plan (objective, workload, command, primary metric, scope, constraints, checks) and ask the user to confirm it, keep refining, or cancel. Nothing runs until they confirm.",
+    promptSnippet: "Present the full experiment plan for confirmation before any experiment runs.",
+    promptGuidelines: [
+      `Call ${PROPOSE_PLAN_TOOL_NAME} once the objective, workload, command, metric (+direction), scope and constraints are settled enough for the user to approve.`,
+      "Never start experimenting before confirmation — the loop tools are unavailable during the interview.",
+    ],
+    parameters: PlanParams,
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const runtime = getRuntime(ctx);
+      if (!runtime.interviewMode) {
+        return {
+          content: [{
+            type: "text",
+            text: "No setup interview is active, so there is nothing to confirm. If the user wants a new session, ask them to run /autoresearch <goal> again.",
+          }],
+          details: {},
+        };
+      }
+
+      const validation = validatePlan({
+        objective: params.objective,
+        workload: params.workload,
+        command: params.command,
+        metricName: params.metric_name,
+        metricUnit: params.metric_unit,
+        direction: params.direction,
+        secondaryMetrics: params.secondary_metrics,
+        filesInScope: params.files_in_scope,
+        offLimits: params.off_limits,
+        constraints: params.constraints,
+        checks: params.checks,
+        maxIterations: params.max_iterations ?? null,
+      });
+      if (!validation.ok) {
+        // A malformed plan must never reach the user as a "confirm" dialog.
+        return {
+          content: [{
+            type: "text",
+            text: `The plan cannot be proposed yet:\n${validation.problems.map((problem) => `- ${problem}`).join("\n")}\n\nFix these and call ${PROPOSE_PLAN_TOOL_NAME} again.`,
+          }],
+          details: { problems: validation.problems },
+        };
+      }
+
+      const plan: ExperimentPlan = validation.plan;
+      // Publish the full plan to the transcript first: the modal that follows is
+      // short (dialog titles render inline and must not be a wall of text), so
+      // the user has to be able to read the plan above it before deciding.
+      _onUpdate({ content: [{ type: "text", text: renderPlan(plan) }], details: {} });
+      const review = await reviewPlan(ctx, renderPlanSummary(plan));
+      if (review.unavailable) {
+        return { content: [{ type: "text", text: DIALOG_UNAVAILABLE_HINT }], details: {} };
+      }
+
+      if (review.decision === "refine") {
+        const change = (await ctx.ui.input("What should change about the plan?", "e.g. use p50 latency at batch 8, not mean"))?.trim();
+        return {
+          content: [{
+            type: "text",
+            text: change
+              ? `The user is not ready to confirm. Requested change:\n\n> ${change}\n\nAdjust the plan accordingly, ask another question if needed, then propose again.`
+              : "The user is not ready to confirm but did not say what to change. Ask what they want different, then propose again.",
+          }],
+          details: { decision: review.decision },
+        };
+      }
+
+      const workDir = resolveWorkDir(ctx.cwd);
+      const now = new Date().toISOString();
+
+      if (review.decision === "cancel") {
+        recordAutoresearchActivation(workDir, false);
+        writeInterviewEntry(ctx, {
+          version: INTERVIEW_ENTRY_VERSION,
+          phase: "cancelled",
+          topic: runtime.interviewTopic,
+          startedAt: now,
+          settledAt: now,
+        });
+        setAutoresearchMode(ctx, false);
+        runtime.interviewTopic = "";
+        clearSessionUi(ctx);
+        return {
+          content: [{
+            type: "text",
+            text: "The user cancelled the session. Autoresearch mode is OFF. Stop here: do not create .auto/ files, do not run experiments. Briefly confirm the cancellation.",
+          }],
+          details: { decision: review.decision },
+        };
+      }
+
+      // Confirmed: persist the plan, swap to the loop tool surface, hand the
+      // agent the exact setup steps so the files match what the user approved.
+      writeInterviewEntry(ctx, {
+        version: INTERVIEW_ENTRY_VERSION,
+        phase: "confirmed",
+        topic: runtime.interviewTopic,
+        startedAt: now,
+        plan,
+        settledAt: now,
+      });
+      runtime.interviewTopic = "";
+      setInterviewMode(ctx, false);
+      const steer = confirmedPlanSteer(plan);
+      pi.sendUserMessage(steer, { deliverAs: "steer" });
+      return {
+        content: [{
+          type: "text",
+          text: `${renderPlan(plan)}\n\nConfirmed. Setting the session up now.`,
+        }],
+        details: { decision: review.decision, plan },
+      };
+    },
+
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("propose_experiment_plan ")) + theme.fg("accent", args.metric_name ?? ""),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _options, theme) {
+      const t = result.content[0];
+      return new Text(t?.type === "text" ? t.text : "", 0, 0);
+    },
   });
 
   // -----------------------------------------------------------------------
@@ -3103,24 +3467,50 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return;
       }
 
+      // `--no-interview` (or PI_AUTORESEARCH_INTERVIEW=0) skips guided setup and
+      // goes straight to building the session, for people who already know the
+      // goal. The flag is stripped so it never reaches the agent as goal text.
+      const skipInterviewFlag = /(^|\s)--no-interview(?=\s|$)/i.test(trimmedArgs);
+      const topic = trimmedArgs.replace(/(^|\s)--no-interview(?=\s|$)/gi, " ").replace(/\s+/g, " ").trim();
+
       const workDir = resolveWorkDir(ctx.cwd);
       recordAutoresearchActivation(workDir, true);
       setAutoresearchMode(ctx, true);
       runtime.autoResumeTurns = 0;
       const rulesLoaded = hasAutoresearchRules(ctx);
+      // A fresh session with a UI starts in the interview phase: refine the goal
+      // with the user before anything is written or measured.
+      const interviewing =
+        !rulesLoaded &&
+        !skipInterviewFlag &&
+        process.env.PI_AUTORESEARCH_INTERVIEW !== "0" &&
+        topic.length > 0 &&
+        ctx.hasUI;
+      if (interviewing) {
+        const startedAt = new Date().toISOString();
+        setInterviewMode(ctx, true, topic);
+        writeInterviewEntry(ctx, {
+          version: INTERVIEW_ENTRY_VERSION,
+          phase: "interview",
+          topic,
+          startedAt,
+        });
+      }
       // No .auto/prompt.md yet — load the create skill so the agent follows the
       // setup guidelines. `/skill:<name>` is expanded to the full SKILL.md when
       // sent with `expandPromptTemplates` (see sendWhenReady), and trailing args
       // are appended as the session goal. Must be sent as its own message that
       // STARTS with `/skill:` so expansion triggers — don't prepend hook output.
       const kickoff = rulesLoaded
-        ? `Autoresearch mode active. ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`
-        : `/skill:autoresearch-create ${trimmedArgs} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
+        ? `Autoresearch mode active. ${topic} ${BENCHMARK_GUARDRAIL}`
+        : `/skill:autoresearch-create ${topic} ${BENCHMARK_GUARDRAIL}`.replace(/\s+/g, " ").trim();
 
       ctx.ui.notify(
-        rulesLoaded
-          ? "Autoresearch mode ON — rules loaded from .auto/prompt.md"
-          : "Autoresearch mode ON — no .auto/prompt.md found, loading autoresearch-create skill",
+        interviewing
+          ? "Autoresearch mode ON — interview phase: refining the goal first (add --no-interview to skip)"
+          : rulesLoaded
+            ? "Autoresearch mode ON — rules loaded from .auto/prompt.md"
+            : "Autoresearch mode ON — no .auto/prompt.md found, loading autoresearch-create skill",
         "info",
       );
 

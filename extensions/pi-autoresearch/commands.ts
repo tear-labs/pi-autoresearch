@@ -53,6 +53,10 @@ export function renderAutoresearchHelp(): string {
     "",
     ...describedLines([FREE_TEXT, ...SUBCOMMANDS]),
     "",
+    "A fresh session without .auto/prompt.md starts with guided setup: the agent",
+    "asks a few focused questions, then shows a plan to confirm before anything",
+    "runs. Add --no-interview to skip setup and start the session directly.",
+    "",
     "Examples:",
     ...EXAMPLES.map((example) => `  ${example}`),
   ].join("\n");

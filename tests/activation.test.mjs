@@ -12,7 +12,9 @@ import autoresearchExtension, {
 } from "../extensions/pi-autoresearch/index.ts";
 
 const ACTIVATION_ENTRY = "pi-autoresearch.activation";
+const INTERVIEW_ENTRY = "pi-autoresearch-interview";
 const AUTORESEARCH_TOOLS = ["init_experiment", "log_experiment", "run_experiment"];
+const INTERVIEW_TOOLS = ["ask_experiment_question", "propose_experiment_plan"];
 const FINALIZE_KICKOFF = { content: "/skill:autoresearch-finalize", options: { expandPromptTemplates: true } };
 const LONGER_THAN_AUTO_RESUME_DELAY_MS = 10_000;
 
@@ -321,7 +323,7 @@ test("starting autoresearch binds redirected workingDir activation to the pi ses
     );
 
     const harness = createHarness({ cwd });
-    await harness.commands.get("autoresearch").handler("optimize runtime", harness.ctx);
+    await harness.commands.get("autoresearch").handler("optimize runtime --no-interview", harness.ctx);
 
     assert.deepEqual(harness.activeTools().sort(), AUTORESEARCH_TOOLS.sort());
     assert.equal(harness.appendedEntries.length, 1);
@@ -346,6 +348,62 @@ test("starting autoresearch without prompt.md sends the create skill with expans
     const [kickoff] = harness.sentMessages;
     assert.match(kickoff.content, /^\/skill:autoresearch-create optimize runtime/);
     assert.equal(kickoff.options.expandPromptTemplates, true);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a fresh session with a UI starts in the guided-setup interview, not the loop", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-autoresearch-cwd-"));
+
+  try {
+    const harness = createHarness({ cwd });
+    await harness.commands.get("autoresearch").handler("optimize runtime", harness.ctx);
+
+    // Loop tools are withheld until the plan is confirmed.
+    assert.deepEqual(harness.activeTools().sort(), [...INTERVIEW_TOOLS].sort());
+    for (const tool of INTERVIEW_TOOLS) assert.ok(harness.tools.has(tool), `${tool} is registered`);
+
+    const entry = harness.appendedEntries.at(-1);
+    assert.equal(entry.customType, INTERVIEW_ENTRY);
+    assert.equal(entry.data.phase, "interview");
+    assert.equal(entry.data.topic, "optimize runtime");
+    assert.equal(harness.sentMessages.length, 1);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("--no-interview keeps the classic straight-to-setup activation", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-autoresearch-cwd-"));
+
+  try {
+    const harness = createHarness({ cwd });
+    await harness.commands.get("autoresearch").handler("--no-interview optimize runtime", harness.ctx);
+
+    assert.deepEqual(harness.activeTools().sort(), AUTORESEARCH_TOOLS.sort());
+    assert.equal(harness.appendedEntries.some((entry) => entry.customType === INTERVIEW_ENTRY), false);
+    // The flag is a control token, never goal text.
+    assert.match(harness.sentMessages[0].content, /^\/skill:autoresearch-create optimize runtime/);
+    assert.doesNotMatch(harness.sentMessages[0].content, /--no-interview/);
+  } finally {
+    await rm(cwd, { recursive: true, force: true });
+  }
+});
+
+test("an unconfirmed interview is restored on session_start instead of the loop", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "pi-autoresearch-cwd-"));
+  const branch = [{
+    type: "custom",
+    customType: INTERVIEW_ENTRY,
+    data: { version: 1, phase: "interview", topic: "optimize runtime", startedAt: new Date().toISOString() },
+  }];
+
+  try {
+    const harness = createHarness({ cwd, branch });
+    await harness.handlers.get("session_start")({}, harness.ctx);
+
+    assert.deepEqual(harness.activeTools().sort(), INTERVIEW_TOOLS.slice().sort());
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }

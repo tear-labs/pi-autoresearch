@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Guided setup ("interview mode").** A fresh session no longer starts the loop from a one-line goal. `/autoresearch <text>` now begins with a short back-and-forth: `ask_experiment_question` asks one focused question at a time (concrete options, a marked recommendation, and a write-your-own escape hatch), and `propose_experiment_plan` shows the complete plan — objective, workload, command, primary metric with unit and direction, secondary metrics, files in scope, off limits, constraints, optional checks, and the iteration cap — for **Confirm / Keep refining / Cancel** before anything is written or measured. The interaction shape follows `pi-goal-x`'s goal drafting flow.
+- The loop tools (`init_experiment`, `run_experiment`, `log_experiment`) are unavailable during setup, so an unconfirmed plan cannot burn iterations. The setup tools disappear once the plan is confirmed.
+- The confirmed plan is restated back to the agent with the ordered setup steps (write `.auto/prompt.md`, `.auto/measure.sh`, optional `.auto/checks.sh` and `.auto/config.json`, commit, `init_experiment`, baseline, loop), so the files match what the user approved.
+- Setup state is durable: an unconfirmed interview survives compaction and tree navigation via a session entry and is restored on `session_start` instead of silently dropping into the loop.
+- `/autoresearch --no-interview <text>` (or `PI_AUTORESEARCH_INTERVIEW=0`) skips guided setup; sessions without a UI skip it automatically.
+
 ## [1.9.0] - 2026-10-06
 
 ### Added
