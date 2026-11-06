@@ -1,8 +1,9 @@
 name: Publish to npm
 
+# This fork never publishes on push: its package name is the same as upstream's,
+# so an automatic publish from here would collide with the upstream release.
+# Run it manually (workflow_dispatch) only if you fork the package name too.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
